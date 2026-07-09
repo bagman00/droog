@@ -1,0 +1,387 @@
+package session
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/bagman00/droog/internal/mpv"
+	"github.com/bagman00/droog/internal/p2p"
+	"github.com/bagman00/droog/internal/queue"
+	"github.com/bagman00/droog/internal/room"
+	tsync "github.com/bagman00/droog/internal/sync"
+	"github.com/bagman00/droog/internal/tui"
+)
+
+type Config struct {
+	LocalID   string
+	RemoteID  string
+	RoomCode  string
+	IsHost    bool
+	MpvSocket string
+	Transport p2p.Sender
+	UIEvents  chan<- tui.UIEvent
+}
+
+type Session struct {
+	cfg        Config
+	transport  p2p.Sender
+	mpv        *mpv.Bridge
+	room       *room.Room
+	reconciler *tsync.Reconciler
+	delta      *tsync.DeltaEngine
+	queue      *queue.Queue
+	mpvOK      bool
+
+	mu          sync.RWMutex
+	lastPeerMsg time.Time
+	buffering   bool
+}
+
+func (s *Session) emitUI(ev tui.UIEvent) {
+	if s.cfg.UIEvents == nil {
+		return
+	}
+	select {
+	case s.cfg.UIEvents <- ev:
+	default:
+	}
+}
+
+func New(cfg Config) *Session {
+	return &Session{
+		cfg:       cfg,
+		transport: cfg.Transport,
+		queue:     queue.New(),
+	}
+}
+
+func (s *Session) Run(ctx context.Context) error {
+	s.mpv = mpv.NewBridge(s.cfg.MpvSocket)
+	if err := s.mpv.Connect(); err != nil {
+		log.Printf("[session] mpv not connected: %v (will retry in background)", err)
+		s.mpvOK = false
+	} else {
+		s.mpvOK = true
+		log.Printf("[session] connected to mpv at %s", s.cfg.MpvSocket)
+	}
+
+	go s.mpvReconnectLoop(ctx)
+
+	hostID := s.cfg.LocalID
+	if !s.cfg.IsHost {
+		hostID = s.cfg.RemoteID
+	}
+
+	s.room = room.NewRoom(s.cfg.RoomCode, hostID)
+	defer s.room.Shutdown()
+
+	s.room.Send(room.Event{
+		PeerID: s.cfg.RemoteID,
+		Type:   room.EvPeerJoined,
+	})
+
+	s.reconciler = tsync.NewReconciler()
+	s.reconciler.Start()
+	defer s.reconciler.Stop()
+
+	s.delta = tsync.NewDeltaEngine(s.cfg.LocalID, hostID, s.cfg.IsHost, s.positionFunc())
+	s.delta.Start()
+	defer s.delta.Stop()
+
+	s.transport.Send(p2p.MsgHello, &p2p.HelloPayload{
+		DisplayName: s.cfg.LocalID,
+		Version:     "0.1.0",
+		IsHost:      s.cfg.IsHost,
+	})
+
+	go s.clockSyncLoop(ctx)
+	go s.broadcastLoop(ctx)
+	go s.heartbeatLoop(ctx)
+	go s.watchdogLoop(ctx)
+
+	log.Printf("[session] running — room=%s peer=%s host=%v", s.cfg.RoomCode, s.cfg.RemoteID, s.cfg.IsHost)
+
+	return s.loop(ctx)
+}
+
+func (s *Session) loop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			s.transport.Send(p2p.MsgBye, &p2p.ByePayload{Reason: "session ended"})
+			return nil
+
+		case env := <-s.transport.Recv():
+			s.handleMessage(env)
+
+		case c := <-s.delta.CorrectionCh:
+			s.applyCorrection(c)
+
+		case cmd := <-s.room.CommandCh:
+			s.executeCommand(cmd)
+		}
+	}
+}
+
+func (s *Session) handleMessage(env *p2p.Envelope) {
+	s.touchPeerSeen()
+
+	switch env.Type {
+	case p2p.MsgHello:
+		var pl p2p.HelloPayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			log.Printf("[session] peer hello: %s (v%s, host=%v)", pl.DisplayName, pl.Version, pl.IsHost)
+			s.room.Send(room.Event{PeerID: env.SenderID, Type: room.EvPeerReady})
+			s.emitUI(tui.UIEvent{Type: tui.UIPeerHello, Data: tui.PeerData{
+				PeerID: env.SenderID, DisplayName: pl.DisplayName,
+			}})
+		}
+
+	case p2p.MsgHeartbeat:
+
+	case p2p.MsgBye:
+		log.Printf("[session] peer %s disconnected", env.SenderID)
+		s.room.Send(room.Event{PeerID: env.SenderID, Type: room.EvPeerLeft})
+		s.emitUI(tui.UIEvent{Type: tui.UIPeerBye, Data: tui.PeerData{PeerID: env.SenderID}})
+
+	case p2p.MsgPing:
+		s.handlePing(env)
+
+	case p2p.MsgPong:
+		s.handlePong(env)
+
+	case p2p.MsgPlay:
+		var pl p2p.PlayPayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			log.Printf("[session] play at %.2fs (scheduled %v from now)", pl.Position, time.Until(pl.At))
+			if s.mpvOK {
+				s.mpv.Seek(time.Duration(pl.Position * float64(time.Second)))
+				delay := time.Until(pl.At)
+				if delay > 0 {
+					time.Sleep(delay)
+				}
+				s.mpv.Play()
+			}
+		}
+
+	case p2p.MsgPause:
+		var pl p2p.PausePayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			log.Printf("[session] pause at %.2fs", pl.Position)
+			if s.mpvOK {
+				s.mpv.Pause()
+			}
+		}
+
+	case p2p.MsgSeek:
+		var pl p2p.SeekPayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			log.Printf("[session] seek to %.2fs", pl.Position)
+			if s.mpvOK {
+				s.mpv.Seek(time.Duration(pl.Position * float64(time.Second)))
+			}
+		}
+
+	case p2p.MsgStateUpdate:
+		var pl p2p.StateUpdatePayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			s.delta.UpdatePeer(tsync.PeerPosition{
+				PeerID:    env.SenderID,
+				Position:  time.Duration(pl.Position * float64(time.Second)),
+				Paused:    pl.Paused,
+				SampledAt: env.SentAt,
+			})
+		}
+
+	case p2p.MsgHold:
+		log.Printf("[session] peer %s is buffering", env.SenderID)
+		s.room.Send(room.Event{PeerID: env.SenderID, Type: room.EvPeerBuffering})
+
+	case p2p.MsgResume:
+		log.Printf("[session] peer %s ready to resume", env.SenderID)
+		s.room.Send(room.Event{PeerID: env.SenderID, Type: room.EvPeerResumed})
+
+	case p2p.MsgQueueAdd:
+		var pl p2p.QueueAddPayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			s.queue.Add(pl.Item.Filename, pl.Item.AddedBy)
+			log.Printf("[session] queue add: %s (by %s)", pl.Item.Filename, pl.Item.AddedBy)
+			s.emitUI(tui.UIEvent{Type: tui.UIQueueUpdate, Data: tui.QueueData{
+				Items:   s.queueItems(),
+				Current: s.queue.CurrentIndex(),
+			}})
+		}
+
+	case p2p.MsgQueueNext:
+		if item, ok := s.queue.Next(); ok {
+			log.Printf("[session] queue next: %s", item.Filename)
+			if s.mpvOK {
+				s.mpv.LoadFile(item.Filename)
+			}
+			s.emitUI(tui.UIEvent{Type: tui.UIQueueUpdate, Data: tui.QueueData{
+				Items:   s.queueItems(),
+				Current: s.queue.CurrentIndex(),
+			}})
+		}
+
+	case p2p.MsgQueueRemove:
+		var pl p2p.QueueRemovePayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			s.queue.Remove(pl.ItemID)
+			log.Printf("[session] queue remove: %s", pl.ItemID)
+			s.emitUI(tui.UIEvent{Type: tui.UIQueueUpdate, Data: tui.QueueData{
+				Items:   s.queueItems(),
+				Current: s.queue.CurrentIndex(),
+			}})
+		}
+	}
+}
+
+func (s *Session) applyCorrection(c tsync.Correction) {
+	if !s.mpvOK {
+		return
+	}
+
+	switch c.Type {
+	case tsync.CorrectionMicroSeek:
+		log.Printf("[session] micro-seek: delta=%v target=%v", c.Delta, c.TargetPos)
+		s.mpv.SeekExact(c.TargetPos)
+	case tsync.CorrectionHardResync:
+		log.Printf("[session] hard resync: delta=%v target=%v", c.Delta, c.TargetPos)
+		s.mpv.Seek(c.TargetPos)
+	case tsync.CorrectionPause:
+		log.Printf("[session] sync pause (peer %s too far ahead)", c.PeerID)
+		s.mpv.Pause()
+	case tsync.CorrectionResume:
+		log.Printf("[session] sync resume to %v", c.TargetPos)
+		s.mpv.Seek(c.TargetPos)
+		s.mpv.Play()
+	}
+
+	s.emitUI(tui.UIEvent{Type: tui.UICorrection, Data: tui.CorrectionData{
+		CorrType: c.Type.String(),
+		Delta:    c.Delta,
+		Target:   c.TargetPos,
+	}})
+}
+
+func (s *Session) executeCommand(cmd room.Command) {
+	switch cmd.Type {
+	case room.CmdPlay:
+		pos := float64(0)
+		if s.mpvOK {
+			if p, err := s.mpv.GetPosition(); err == nil {
+				pos = p.Seconds()
+			}
+			s.mpv.Play()
+		}
+		s.transport.Send(p2p.MsgPlay, &p2p.PlayPayload{
+			Position: pos,
+			At:       cmd.At,
+		})
+
+	case room.CmdPause:
+		pos := float64(0)
+		if s.mpvOK {
+			if p, err := s.mpv.GetPosition(); err == nil {
+				pos = p.Seconds()
+			}
+			s.mpv.Pause()
+		}
+		s.transport.Send(p2p.MsgPause, &p2p.PausePayload{Position: pos})
+
+	case room.CmdSeek:
+		if s.mpvOK {
+			s.mpv.Seek(cmd.Position)
+		}
+		s.transport.Send(p2p.MsgSeek, &p2p.SeekPayload{
+			Position: cmd.Position.Seconds(),
+		})
+	}
+}
+
+func (s *Session) positionFunc() tsync.PositionFunc {
+	return func() (time.Duration, bool, error) {
+		if !s.mpvOK {
+			return 0, true, nil
+		}
+		st := s.mpv.State()
+		return st.Position, st.Paused, nil
+	}
+}
+
+func (s *Session) QueueAdd(filename string) {
+	item := s.queue.Add(filename, s.cfg.LocalID)
+	s.transport.Send(p2p.MsgQueueAdd, &p2p.QueueAddPayload{
+		Item: p2p.QueueItem{
+			ID:       item.ID,
+			Filename: item.Filename,
+			AddedBy:  item.AddedBy,
+		},
+	})
+	s.emitUI(tui.UIEvent{Type: tui.UIQueueUpdate, Data: tui.QueueData{
+		Items:   s.queueItems(),
+		Current: s.queue.CurrentIndex(),
+	}})
+}
+
+func (s *Session) QueueNext() {
+	item, ok := s.queue.Next()
+	if !ok {
+		return
+	}
+	if s.mpvOK {
+		s.mpv.LoadFile(item.Filename)
+	}
+	s.transport.Send(p2p.MsgQueueNext, &p2p.QueueNextPayload{
+		NextItemID: item.ID,
+	})
+	s.emitUI(tui.UIEvent{Type: tui.UIQueueUpdate, Data: tui.QueueData{
+		Items:   s.queueItems(),
+		Current: s.queue.CurrentIndex(),
+	}})
+}
+
+func (s *Session) queueItems() []tui.QueueItemData {
+	items := s.queue.Items()
+	out := make([]tui.QueueItemData, len(items))
+	for i, item := range items {
+		out[i] = tui.QueueItemData{
+			ID:       item.ID,
+			Filename: item.Filename,
+			AddedBy:  item.AddedBy,
+		}
+	}
+	return out
+}
+
+func (s *Session) mpvReconnectLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			if s.mpvOK {
+				s.mpv.Close()
+			}
+			return
+		case <-ticker.C:
+			if s.mpvOK {
+				if _, _, err := s.positionFunc()(); err != nil {
+					log.Printf("[session] mpv disconnected, will retry")
+					s.mpvOK = false
+					s.emitUI(tui.UIEvent{Type: tui.UILog, Data: "mpv disconnected. retrying"})
+				}
+			} else {
+				if err := s.mpv.Connect(); err == nil {
+					s.mpvOK = true
+					log.Printf("[session] mpv reconnected")
+					s.emitUI(tui.UIEvent{Type: tui.UILog, Data: "mpv reconnected"})
+				}
+			}
+		}
+	}
+}
