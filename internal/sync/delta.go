@@ -117,11 +117,7 @@ func (e *DeltaEngine) Deltas() map[string]time.Duration {
 
 	out := make(map[string]time.Duration, len(e.peers))
 	for id, p := range e.peers {
-
-		estimated := p.Position
-		if !p.Paused {
-			estimated += time.Since(p.SampledAt)
-		}
+		estimated := estimatedPos(p)
 		out[id] = localPos - estimated
 	}
 	return out
@@ -141,10 +137,12 @@ func (e *DeltaEngine) loop() {
 	}
 }
 
+// tick runs the SAME symmetric sync logic regardless of host/peer role.
+// Whichever side changes state (pause/resume/seek), the other follows.
+// This replaces the old asymmetric tickHost/tickPeer split.
 func (e *DeltaEngine) tick() {
 	localPos, localPaused, err := e.getPos()
 	if err != nil {
-
 		return
 	}
 
@@ -152,90 +150,60 @@ func (e *DeltaEngine) tick() {
 		return
 	}
 
-	if e.isHost {
-		e.tickHost(localPos, localPaused)
-	} else {
-		e.tickPeer(localPos, localPaused)
-	}
-}
-
-func (e *DeltaEngine) tickPeer(localPos time.Duration, localPaused bool) {
-	e.mu.RLock()
-	host, ok := e.peers[e.hostID]
-	e.mu.RUnlock()
-
-	if !ok {
-
-		return
-	}
-
-	hostPos := estimatedPos(host)
-
-	delta := localPos - hostPos
-	absDelta := abs(delta)
-
-	switch {
-	case absDelta < MicroSeekThreshold:
-
-	case absDelta <= SyncTolerance:
-
-	case absDelta > MaxSeekDelta:
-
-		e.emit(Correction{
-			Type:      CorrectionHardResync,
-			TargetPos: hostPos,
-			Delta:     delta,
-			PeerID:    e.hostID,
-			EmittedAt: time.Now(),
-		})
-
-	default:
-
-		target := hostPos + (delta / 2)
-		e.emit(Correction{
-			Type:      CorrectionMicroSeek,
-			TargetPos: target,
-			Delta:     delta,
-			PeerID:    e.hostID,
-			EmittedAt: time.Now(),
-		})
-	}
-
-	if host.Paused && !localPaused {
-		e.emit(Correction{
-			Type:      CorrectionPause,
-			Delta:     0,
-			PeerID:    e.hostID,
-			EmittedAt: time.Now(),
-		})
-	} else if !host.Paused && localPaused {
-		e.emit(Correction{
-			Type:      CorrectionResume,
-			TargetPos: hostPos,
-			Delta:     0,
-			PeerID:    e.hostID,
-			EmittedAt: time.Now(),
-		})
-	}
-}
-
-func (e *DeltaEngine) tickHost(localPos time.Duration, _ bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	for id, p := range e.peers {
+		// Skip peers we have no real sample for yet (avoids the
+		// zero-SampledAt bug producing a multi-year "delta").
+		if p.SampledAt.IsZero() {
+			continue
+		}
+
 		estimated := estimatedPos(p)
 		delta := localPos - estimated
+		absDelta := abs(delta)
 
-		if delta > MaxSeekDelta {
+		switch {
+		case absDelta < MicroSeekThreshold:
 
+		case absDelta <= SyncTolerance:
+
+		case absDelta > MaxSeekDelta:
 			e.emit(Correction{
-				Type:      CorrectionPause,
+				Type:      CorrectionHardResync,
+				TargetPos: estimated,
 				Delta:     delta,
 				PeerID:    id,
 				EmittedAt: time.Now(),
 			})
-			return
+
+		default:
+			target := estimated + (delta / 2)
+			e.emit(Correction{
+				Type:      CorrectionMicroSeek,
+				TargetPos: target,
+				Delta:     delta,
+				PeerID:    id,
+				EmittedAt: time.Now(),
+			})
+		}
+
+		if p.Paused && !localPaused {
+			e.emit(Correction{
+				Type:      CorrectionPause,
+				Delta:     0,
+				PeerID:    id,
+				EmittedAt: time.Now(),
+			})
+		} else if !p.Paused && localPaused {
+			e.emit(Correction{
+				Type:      CorrectionResume,
+				TargetPos: estimated,
+				Delta:     0,
+				PeerID:    id,
+				EmittedAt: time.Now(),
+			})
 		}
 	}
 }
@@ -245,7 +213,6 @@ func (e *DeltaEngine) emit(c Correction) {
 	select {
 	case e.CorrectionCh <- c:
 	default:
-
 	}
 }
 
@@ -285,8 +252,12 @@ func (e *DeltaEngine) Report() (SyncReport, error) {
 }
 
 func estimatedPos(p *PeerPosition) time.Duration {
+	if p.SampledAt.IsZero() {
+		return p.Position
+	}
 	if p.Paused {
 		return p.Position
 	}
 	return p.Position + time.Since(p.SampledAt)
 }
+
