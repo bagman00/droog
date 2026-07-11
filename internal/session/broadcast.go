@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/bagman00/droog/internal/p2p"
@@ -56,6 +57,28 @@ func (s *Session) broadcastState() {
 			})
 			s.emitUI(tui.UIEvent{Type: tui.UIBufferingStop})
 		}
+
+		s.mu.Lock()
+		if !s.pauseSyncReady {
+			s.lastBroadcastPaused = paused
+			s.pauseSyncReady = true
+		} else if paused != s.lastBroadcastPaused {
+			s.lastBroadcastPaused = paused
+			s.mu.Unlock()
+
+			if paused {
+				log.Printf("[session] pause edge → broadcasting pause at %.2fs", pos)
+				s.transport.Send(p2p.MsgPause, &p2p.PausePayload{Position: pos})
+			} else {
+				log.Printf("[session] play edge → broadcasting play at %.2fs", pos)
+				s.transport.Send(p2p.MsgPlay, &p2p.PlayPayload{
+					Position: pos,
+					At:       time.Now(),
+				})
+			}
+			s.mu.Lock()
+		}
+		s.mu.Unlock()
 	}
 
 	deltas := s.delta.Deltas()

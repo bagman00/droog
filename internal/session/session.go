@@ -34,9 +34,11 @@ type Session struct {
 	queue      *queue.Queue
 	mpvOK      bool
 
-	mu          sync.RWMutex
-	lastPeerMsg time.Time
-	buffering   bool
+	mu                 sync.RWMutex
+	lastPeerMsg        time.Time
+	buffering          bool
+	lastBroadcastPaused bool
+	pauseSyncReady     bool
 }
 
 func (s *Session) emitUI(ev tui.UIEvent) {
@@ -187,11 +189,17 @@ func (s *Session) handleMessage(env *p2p.Envelope) {
 	case p2p.MsgStateUpdate:
 		var pl p2p.StateUpdatePayload
 		if p2p.DecodePayload(env, &pl) == nil {
+			// Translate the peer's self-reported send time into our own
+			// clock's frame of reference using the measured NTP-style
+			// offset, so position estimation isn't corrupted by clock skew.
+			offset := s.reconciler.PeerOffset(env.SenderID)
+			adjustedSampledAt := env.SentAt.Add(-offset)
+
 			s.delta.UpdatePeer(tsync.PeerPosition{
 				PeerID:    env.SenderID,
 				Position:  time.Duration(pl.Position * float64(time.Second)),
 				Paused:    pl.Paused,
-				SampledAt: env.SentAt,
+				SampledAt: adjustedSampledAt,
 			})
 		}
 

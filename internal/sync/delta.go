@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-const SyncTolerance = 40 * time.Millisecond
+const SyncTolerance = 120 * time.Millisecond      // was 40ms — too sensitive to local jitter
 
-const MicroSeekThreshold = 5 * time.Millisecond
+const MicroSeekThreshold = 60 * time.Millisecond  // was 5ms — was firing on noise, not real drift
+
 
 const MaxSeekDelta = 2 * time.Second
 
@@ -80,7 +81,7 @@ func NewDeltaEngine(localID, hostID string, isHost bool, getPos PositionFunc) *D
 		getPos:       getPos,
 		tickRate:     50 * time.Millisecond,
 		peers:        make(map[string]*PeerPosition),
-		cooldown:     150 * time.Millisecond,
+		cooldown:     1200 * time.Millisecond,  // was 150ms — gave the feedback loop no time to settle
 		CorrectionCh: make(chan Correction, 32),
 		stopCh:       make(chan struct{}),
 	}
@@ -141,7 +142,7 @@ func (e *DeltaEngine) loop() {
 // Whichever side changes state (pause/resume/seek), the other follows.
 // This replaces the old asymmetric tickHost/tickPeer split.
 func (e *DeltaEngine) tick() {
-	localPos, localPaused, err := e.getPos()
+	localPos, _, err := e.getPos()
 	if err != nil {
 		return
 	}
@@ -189,22 +190,10 @@ func (e *DeltaEngine) tick() {
 			})
 		}
 
-		if p.Paused && !localPaused {
-			e.emit(Correction{
-				Type:      CorrectionPause,
-				Delta:     0,
-				PeerID:    id,
-				EmittedAt: time.Now(),
-			})
-		} else if !p.Paused && localPaused {
-			e.emit(Correction{
-				Type:      CorrectionResume,
-				TargetPos: estimated,
-				Delta:     0,
-				PeerID:    id,
-				EmittedAt: time.Now(),
-			})
-		}
+		// Pause/resume is synced via explicit MsgPause/MsgPlay messages
+		// (edge-triggered in broadcastState). Doing it here caused a feedback
+		// loop: the side that paused locally still had stale peer state showing
+		// playing, so it emitted CorrectionResume and fought its own pause.
 	}
 }
 
