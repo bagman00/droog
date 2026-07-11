@@ -54,6 +54,15 @@ func (r *Reconciler) Correction() time.Duration {
 	return r.correction
 }
 
+func (r *Reconciler) PeerOffset(peerID string) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if o, ok := r.offsets[peerID]; ok {
+		return o.Delta
+	}
+	return 0
+}
+
 func (r *Reconciler) NeedsSync() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

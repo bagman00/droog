@@ -21,6 +21,9 @@ type Bridge struct {
 	mu      sync.RWMutex
 	eventCh <-chan tui.UIEvent
 	cmdCh   chan Command
+
+	lastInit     []byte
+	lastInitOnce sync.Once
 }
 
 type Command struct {
@@ -68,6 +71,12 @@ func (b *Bridge) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	b.mu.Lock()
 	b.clients[conn] = true
+	// Replay the last "init" payload to this new client — it almost
+	// certainly missed the original one-time broadcast, since the browser
+	// takes real time to load and connect after the server starts.
+	if b.lastInit != nil {
+		_ = conn.WriteMessage(websocket.TextMessage, b.lastInit)
+	}
 	b.mu.Unlock()
 
 	log.Printf("[web] client connected (%d total)", len(b.clients))
@@ -155,6 +164,12 @@ func (b *Bridge) Broadcast(ev Event) {
 	if err != nil {
 		return
 	}
+
+	b.mu.Lock()
+	if ev.Type == "init" {
+		b.lastInit = data
+	}
+	b.mu.Unlock()
 
 	b.mu.RLock()
 	defer b.mu.RUnlock()
