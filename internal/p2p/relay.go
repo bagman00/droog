@@ -14,6 +14,7 @@ import (
 
 type RelayTransport struct {
 	conn     *websocket.Conn
+	writeMu  sync.Mutex
 	localID  string
 	roomCode string
 	seq      atomic.Uint64
@@ -68,6 +69,8 @@ func (rt *RelayTransport) Send(msgType MsgType, payload any) error {
 		return fmt.Errorf("relay: build: %w", err)
 	}
 
+	rt.writeMu.Lock()
+	defer rt.writeMu.Unlock()
 	return rt.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
