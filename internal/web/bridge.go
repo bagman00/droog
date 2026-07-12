@@ -22,8 +22,8 @@ type Bridge struct {
 	eventCh <-chan tui.UIEvent
 	cmdCh   chan Command
 
-	lastInit     []byte
-	lastInitOnce sync.Once
+	lastInit   []byte
+	knownPeers map[string][]byte // peerID → last peer_hello JSON, replayed to late-connecting browsers
 }
 
 type Command struct {
@@ -33,10 +33,11 @@ type Command struct {
 
 func NewBridge(addr string, eventCh <-chan tui.UIEvent) *Bridge {
 	return &Bridge{
-		addr:    addr,
-		clients: make(map[*websocket.Conn]bool),
-		eventCh: eventCh,
-		cmdCh:   make(chan Command, 32),
+		addr:       addr,
+		clients:    make(map[*websocket.Conn]bool),
+		eventCh:    eventCh,
+		cmdCh:      make(chan Command, 32),
+		knownPeers: make(map[string][]byte),
 	}
 }
 
@@ -71,11 +72,13 @@ func (b *Bridge) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	b.mu.Lock()
 	b.clients[conn] = true
-	// Replay the last "init" payload to this new client — it almost
-	// certainly missed the original one-time broadcast, since the browser
-	// takes real time to load and connect after the server starts.
+	// Replay cached state — the browser almost certainly missed one-time
+	// events that fired before its websocket connected.
 	if b.lastInit != nil {
 		_ = conn.WriteMessage(websocket.TextMessage, b.lastInit)
+	}
+	for _, peerData := range b.knownPeers {
+		_ = conn.WriteMessage(websocket.TextMessage, peerData)
 	}
 	b.mu.Unlock()
 
@@ -123,6 +126,8 @@ func (b *Bridge) eventLoop() {
 			continue
 		}
 
+		b.trackPeerState(webEv, data)
+
 		b.mu.RLock()
 		for conn := range b.clients {
 			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
@@ -159,6 +164,25 @@ func convertEvent(ev tui.UIEvent) *Event {
 	}
 }
 
+func (b *Bridge) trackPeerState(ev *Event, data []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.updatePeerCache(ev, data)
+}
+
+func (b *Bridge) updatePeerCache(ev *Event, data []byte) {
+	switch ev.Type {
+	case "peer_hello":
+		if d, ok := ev.Data.(tui.PeerData); ok {
+			b.knownPeers[d.PeerID] = data
+		}
+	case "peer_bye":
+		if d, ok := ev.Data.(tui.PeerData); ok {
+			delete(b.knownPeers, d.PeerID)
+		}
+	}
+}
+
 func (b *Bridge) Broadcast(ev Event) {
 	data, err := json.Marshal(ev)
 	if err != nil {
@@ -169,6 +193,7 @@ func (b *Bridge) Broadcast(ev Event) {
 	if ev.Type == "init" {
 		b.lastInit = data
 	}
+	b.updatePeerCache(&ev, data)
 	b.mu.Unlock()
 
 	b.mu.RLock()

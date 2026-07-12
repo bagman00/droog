@@ -57,6 +57,7 @@ func (s *Session) handlePong(env *p2p.Envelope) {
 	}
 
 	s.reconciler.RecordSample(env.SenderID, rtt, offset)
+	s.delta.SetPeerRTT(env.SenderID, rtt)
 	log.Printf("[clocksync] peer=%s rtt=%v offset=%v", env.SenderID, rtt, offset)
 
 	s.emitUI(tui.UIEvent{Type: tui.UIClockSync, Data: tui.ClockSyncData{

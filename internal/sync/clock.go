@@ -41,6 +41,14 @@ func (r *Reconciler) RecordSample(peerID string, rtt time.Duration, offset time.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if prev, ok := r.offsets[peerID]; ok {
+		// Smooth noisy samples so StateUpdate timestamp adjustment
+		// doesn't jump by hundreds of ms between consecutive pings.
+		const alpha = 0.35
+		offset = blendDuration(prev.Delta, offset, alpha)
+		rtt = blendDuration(prev.RTT, rtt, alpha)
+	}
+
 	r.offsets[peerID] = &ClockOffset{
 		Delta:   offset,
 		RTT:     rtt,
@@ -59,6 +67,15 @@ func (r *Reconciler) PeerOffset(peerID string) time.Duration {
 	defer r.mu.RUnlock()
 	if o, ok := r.offsets[peerID]; ok {
 		return o.Delta
+	}
+	return 0
+}
+
+func (r *Reconciler) PeerRTT(peerID string) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if o, ok := r.offsets[peerID]; ok {
+		return o.RTT
 	}
 	return 0
 }
@@ -129,4 +146,8 @@ func abs(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+func blendDuration(prev, sample time.Duration, alpha float64) time.Duration {
+	return time.Duration(float64(prev)*(1-alpha) + float64(sample)*alpha)
 }

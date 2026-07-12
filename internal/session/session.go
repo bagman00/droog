@@ -195,6 +195,7 @@ func (s *Session) handleMessage(env *p2p.Envelope) {
 			offset := s.reconciler.PeerOffset(env.SenderID)
 			adjustedSampledAt := env.SentAt.Add(-offset)
 
+			s.delta.SetPeerRTT(env.SenderID, s.reconciler.PeerRTT(env.SenderID))
 			s.delta.UpdatePeer(tsync.PeerPosition{
 				PeerID:    env.SenderID,
 				Position:  time.Duration(pl.Position * float64(time.Second)),
