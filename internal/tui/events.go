@@ -14,6 +14,7 @@ const (
 	UIBufferingStop
 	UIQueueUpdate
 	UILog
+	UIChat
 )
 
 type UIEvent struct {
@@ -53,4 +54,9 @@ type QueueItemData struct {
 type QueueData struct {
 	Items   []QueueItemData
 	Current int
+}
+
+type ChatData struct {
+	SenderID string
+	Text     string
 }

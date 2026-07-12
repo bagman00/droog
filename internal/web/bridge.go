@@ -159,6 +159,8 @@ func convertEvent(ev tui.UIEvent) *Event {
 		return &Event{Type: "queue_update", Data: ev.Data}
 	case tui.UILog:
 		return &Event{Type: "log", Data: ev.Data}
+	case tui.UIChat:
+		return &Event{Type: "chat", Data: ev.Data}
 	default:
 		return nil
 	}

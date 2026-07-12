@@ -40,6 +40,12 @@ export interface LogEntry {
   text: string;
 }
 
+export interface IncomingChat {
+  SenderID: string;
+  Text: string;
+  id: number;
+}
+
 export function useDroogSocket(url: string) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
@@ -48,6 +54,7 @@ export function useDroogSocket(url: string) {
   const [state, setState] = useState<StateInfo>({ Position: 0, Paused: true, SyncDelta: 0 });
   const [queue, setQueue] = useState<{ items: QueueItem[]; current: number }>({ items: [], current: -1 });
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [incomingChat, setIncomingChat] = useState<IncomingChat[]>([]);
   const [roomState, setRoomState] = useState("IDLE");
   const [reactions, setReactions] = useState<{ id: number; emoji: string }[]>([]);
 
@@ -175,6 +182,15 @@ export function useDroogSocket(url: string) {
             addLog(ev.data);
           }
           break;
+
+        case "chat":
+          if (ev.data?.Text) {
+            setIncomingChat((prev) => [
+              ...prev,
+              { SenderID: ev.data.SenderID, Text: ev.data.Text, id: Date.now() + Math.random() },
+            ]);
+          }
+          break;
       }
     }
 
@@ -209,6 +225,7 @@ export function useDroogSocket(url: string) {
     logs,
     roomState,
     reactions,
+    incomingChat,
     send,
     addReaction,
   };

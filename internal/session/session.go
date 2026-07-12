@@ -143,6 +143,16 @@ func (s *Session) handleMessage(env *p2p.Envelope) {
 
 	case p2p.MsgHeartbeat:
 
+	case p2p.MsgChat:
+		var pl p2p.ChatPayload
+		if p2p.DecodePayload(env, &pl) == nil {
+			log.Printf("[session] chat from %s: %s", env.SenderID, pl.Text)
+			s.emitUI(tui.UIEvent{Type: tui.UIChat, Data: tui.ChatData{
+				SenderID: env.SenderID,
+				Text:     pl.Text,
+			}})
+		}
+
 	case p2p.MsgBye:
 		log.Printf("[session] peer %s disconnected", env.SenderID)
 		s.room.Send(room.Event{PeerID: env.SenderID, Type: room.EvPeerLeft})

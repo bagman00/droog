@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
@@ -106,6 +107,19 @@ func runHost(cmd *cobra.Command, args []string) error {
 
 	bridge := web.NewBridge(":9090", webCh)
 	bridge.Start()
+
+	go func() {
+		for cmd := range bridge.Commands() {
+			if cmd.Type == "chat" {
+				var pl struct {
+					Text string `json:"text"`
+				}
+				if json.Unmarshal(cmd.Data, &pl) == nil && pl.Text != "" {
+					peerSet.Send(p2p.MsgChat, &p2p.ChatPayload{Text: pl.Text})
+				}
+			}
+		}
+	}()
 
 	if !noBrowser {
 		go openBrowser("http://localhost:3000")
