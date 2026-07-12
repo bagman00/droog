@@ -6,10 +6,14 @@ import (
 	"time"
 )
 
-const SyncTolerance = 120 * time.Millisecond      // was 40ms — too sensitive to local jitter
-
-const MicroSeekThreshold = 60 * time.Millisecond  // was 5ms — was firing on noise, not real drift
-
+const (
+	// BaseSyncTolerance is the floor for local / low-latency links.
+	BaseSyncTolerance = 120 * time.Millisecond
+	// NetworkMargin covers clock-offset estimation noise and mpv read jitter.
+	NetworkMargin = 80 * time.Millisecond
+	// MinTicksBeforeCorrect requires sustained drift, not a single noisy sample.
+	MinTicksBeforeCorrect = 6 // 6 × 50ms tick = 300ms sustained
+)
 
 const MaxSeekDelta = 2 * time.Second
 
@@ -57,6 +61,11 @@ type Correction struct {
 
 type PositionFunc func() (pos time.Duration, paused bool, err error)
 
+type peerDriftState struct {
+	rtt             time.Duration
+	consecutiveOver int
+}
+
 type DeltaEngine struct {
 	isHost   bool
 	localID  string
@@ -65,6 +74,7 @@ type DeltaEngine struct {
 
 	mu          sync.RWMutex
 	peers       map[string]*PeerPosition
+	drift       map[string]*peerDriftState
 	hostID      string
 	lastCorrect time.Time
 	cooldown    time.Duration
@@ -81,7 +91,8 @@ func NewDeltaEngine(localID, hostID string, isHost bool, getPos PositionFunc) *D
 		getPos:       getPos,
 		tickRate:     50 * time.Millisecond,
 		peers:        make(map[string]*PeerPosition),
-		cooldown:     1200 * time.Millisecond,  // was 150ms — gave the feedback loop no time to settle
+		drift:        make(map[string]*peerDriftState),
+		cooldown:     1200 * time.Millisecond, // was 150ms — gave the feedback loop no time to settle
 		CorrectionCh: make(chan Correction, 32),
 		stopCh:       make(chan struct{}),
 	}
@@ -105,6 +116,21 @@ func (e *DeltaEngine) RemovePeer(peerID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.peers, peerID)
+	delete(e.drift, peerID)
+}
+
+func (e *DeltaEngine) SetPeerRTT(peerID string, rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ds := e.drift[peerID]
+	if ds == nil {
+		ds = &peerDriftState{}
+		e.drift[peerID] = ds
+	}
+	ds.rtt = rtt
 }
 
 func (e *DeltaEngine) Deltas() map[string]time.Duration {
@@ -151,8 +177,10 @@ func (e *DeltaEngine) tick() {
 		return
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	// Full lock, not RLock: this function creates/mutates entries in
+	// e.drift, so it needs exclusive access, not just read access.
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	for id, p := range e.peers {
 		// Skip peers we have no real sample for yet (avoids the
@@ -164,12 +192,26 @@ func (e *DeltaEngine) tick() {
 		estimated := estimatedPos(p)
 		delta := localPos - estimated
 		absDelta := abs(delta)
+		tolerance := e.syncTolerance(id)
+
+		ds := e.drift[id]
+		if ds == nil {
+			ds = &peerDriftState{}
+			e.drift[id] = ds
+		}
+
+		if absDelta <= tolerance {
+			ds.consecutiveOver = 0
+			continue
+		}
+
+		ds.consecutiveOver++
+		if ds.consecutiveOver < MinTicksBeforeCorrect {
+			continue
+		}
+		ds.consecutiveOver = 0
 
 		switch {
-		case absDelta < MicroSeekThreshold:
-
-		case absDelta <= SyncTolerance:
-
 		case absDelta > MaxSeekDelta:
 			e.emit(Correction{
 				Type:      CorrectionHardResync,
@@ -195,6 +237,21 @@ func (e *DeltaEngine) tick() {
 		// loop: the side that paused locally still had stale peer state showing
 		// playing, so it emitted CorrectionResume and fought its own pause.
 	}
+}
+
+// syncTolerance scales with observed RTT: one-way transit alone can be
+// rtt/2, and clock-offset jitter adds more. Fixed 120ms thresholds were
+// routinely exceeded on 250-400ms links, causing spurious micro-seeks.
+func (e *DeltaEngine) syncTolerance(peerID string) time.Duration {
+	ds := e.drift[peerID]
+	if ds == nil || ds.rtt <= 0 {
+		return BaseSyncTolerance
+	}
+	adaptive := ds.rtt/2 + NetworkMargin
+	if adaptive < BaseSyncTolerance {
+		return BaseSyncTolerance
+	}
+	return adaptive
 }
 
 func (e *DeltaEngine) emit(c Correction) {
@@ -233,7 +290,7 @@ func (e *DeltaEngine) Report() (SyncReport, error) {
 		report.Peers = append(report.Peers, PeerSyncStatus{
 			PeerID:    id,
 			Delta:     delta,
-			Synced:    abs(delta) <= SyncTolerance,
+			Synced:    abs(delta) <= e.syncTolerance(id),
 			Buffering: p.Paused,
 		})
 	}
